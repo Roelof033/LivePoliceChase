@@ -1,0 +1,35 @@
+name: Police Chase Monitor
+
+on:
+  schedule:
+    # Elke 30 minuten (GitHub kan runs enkele minuten vertragen op drukke momenten)
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # handmatig starten via de Actions-tab (handig om te testen)
+
+permissions:
+  contents: write   # nodig om seen.json terug te committen
+
+concurrency:
+  group: chase-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Run monitor
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python3 chase_monitor.py
+
+      - name: Save seen-state back to repo
+        run: |
+          git config user.name "chase-monitor-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add seen.json
+          git diff --cached --quiet || git commit -m "Update seen state [skip ci]"
+          git push
