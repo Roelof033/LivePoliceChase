@@ -1,40 +1,72 @@
 #!/usr/bin/env python3
 """
-Police Chase Monitor — GitHub Actions versie
---------------------------------------------
-Draait één keer per aanroep (GitHub Actions start hem elke 30 min via cron),
-zoekt naar live police chase streams op YouTube en stuurt een pushmelding
-via ntfy.sh bij nieuwe streams.
+Police Chase Monitor v2 — GitHub Actions versie
+------------------------------------------------
+Twee detectiemethodes:
 
-Configuratie gaat via environment variables (in GitHub: repo Secrets):
-  YOUTUBE_API_KEY  - je YouTube Data API v3 key
+1. KANAAL-WATCHLIST (elke run, kost GEEN API-quotum)
+   Checkt voor een vaste lijst betrouwbare kanalen of ze live zijn door
+   hun /live-pagina op te halen. Alert alleen als de streamtitel een
+   chase-woord bevat. Hierdoor kan dit elke 5 minuten draaien.
+
+2. BREDE API-ZOEKTOCHT (1x per uur, als vangnet)
+   Vindt ook chases op kanalen buiten de watchlist. Resultaten gaan
+   door een blacklist-filter tegen gaming/roleplay/compilatie-rommel.
+
+Environment variables (GitHub repo Secrets):
+  YOUTUBE_API_KEY  - YouTube Data API v3 key (alleen nodig voor methode 2)
   NTFY_TOPIC       - je ntfy.sh topic
 """
 
 import json
 import os
+import re
 import sys
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 NTFY_SERVER = "https://ntfy.sh"
-
-# Elke zoekterm kost 100 quota-eenheden per run (10.000/dag beschikbaar).
-# 2 termen x 48 runs/dag = 9.600 -> net binnen het quotum.
-SEARCH_TERMS = [
-    "police chase",
-    "police pursuit",
-]
-
-# Alleen alerts als de titel een van deze woorden bevat (lowercase)
-TITLE_MUST_CONTAIN_ANY = ["chase", "pursuit"]
-
-# Statebestand staat in de repo zelf en wordt na elke run teruggecommit
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
 
+# ---------------------------------------------------------------------------
+# 1. Watchlist: kanalen die echte chases live uitzenden (LA-zenders vooral).
+#    Gebruik de @handle uit de kanaal-URL. Vrij uit te breiden — elke check
+#    is gratis, dus meer kanalen kost niets.
+# ---------------------------------------------------------------------------
+WATCHLIST = [
+    "@LiveNOWfromFOX",
+    "@KTLA5",
+    "@FOXLA",          # FOX 11 Los Angeles
+    "@ABC7",           # ABC7 Los Angeles
+    "@kcalnews",       # KCAL/CBS Los Angeles
+    "@NBCLA",
+]
 
+# Woorden waarvan er minstens één in de titel moet zitten
+KEYWORDS = ["chase", "pursuit", "standoff"]
+
+# Titels met deze woorden worden ALTIJD genegeerd (gaming, roleplay, herhalingen)
+BLACKLIST = [
+    "gta", "fivem", "roleplay", " rp ", "gameplay", "simulator", "beamng",
+    "lego", "minecraft", "compilation", "best of", "top 10", "top10",
+    "caught on camera", "dashcam compilation", "asmr", "lofi", "music",
+    "reaction", "react", "archive", "replay", "rewind",
+]
+
+# Brede API-zoektocht alleen in het eerste run-venster van elk uur
+SEARCH_TERMS = ["police chase", "police pursuit"]
+API_SEARCH_WINDOW_MINUTES = 6   # run met minuut 0-5 doet de API-zoektocht
+
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 def load_seen() -> set:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -48,15 +80,56 @@ def save_seen(seen: set) -> None:
         json.dump(sorted(seen)[-500:], f)
 
 
+# ---------------------------------------------------------------------------
+# Filters
+# ---------------------------------------------------------------------------
+def title_ok(title: str) -> bool:
+    lower = f" {title.lower()} "
+    if not any(k in lower for k in KEYWORDS):
+        return False
+    if any(b in lower for b in BLACKLIST):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Methode 1: watchlist-check zonder API-quotum
+# ---------------------------------------------------------------------------
+def check_channel_live(handle: str):
+    """Haalt youtube.com/<handle>/live op. Retourneert stream-dict of None."""
+    url = f"https://www.youtube.com/{handle}/live"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    # Alleen doorgaan als de stream NU live is
+    if '"isLiveNow":true' not in html:
+        return None
+
+    vid_match = re.search(r'rel="canonical" href="https://www\.youtube\.com/watch\?v=([\w-]{11})"', html)
+    title_match = re.search(r"<title>(.*?)</title>", html, re.DOTALL)
+    if not vid_match or not title_match:
+        return None
+
+    title = title_match.group(1).replace(" - YouTube", "").strip()
+    return {
+        "id": vid_match.group(1),
+        "title": title,
+        "channel": handle,
+        "url": f"https://www.youtube.com/watch?v={vid_match.group(1)}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Methode 2: brede API-zoektocht (vangnet, 1x per uur)
+# ---------------------------------------------------------------------------
 def search_live_streams(query: str) -> list:
     params = urllib.parse.urlencode({
-        "part": "snippet",
-        "q": query,
-        "type": "video",
-        "eventType": "live",
-        "order": "date",
-        "maxResults": 10,
-        "relevanceLanguage": "en",
+        "part": "snippet", "q": query, "type": "video", "eventType": "live",
+        "order": "date", "maxResults": 10, "relevanceLanguage": "en",
         "key": YOUTUBE_API_KEY,
     })
     url = f"https://www.googleapis.com/youtube/v3/search?{params}"
@@ -78,13 +151,9 @@ def search_live_streams(query: str) -> list:
     return results
 
 
-def title_matches(title: str) -> bool:
-    if not TITLE_MUST_CONTAIN_ANY:
-        return True
-    lower = title.lower()
-    return any(word in lower for word in TITLE_MUST_CONTAIN_ANY)
-
-
+# ---------------------------------------------------------------------------
+# Notificatie
+# ---------------------------------------------------------------------------
 def send_ntfy_alert(stream: dict) -> None:
     req = urllib.request.Request(
         f"{NTFY_SERVER}/{NTFY_TOPIC}",
@@ -101,36 +170,56 @@ def send_ntfy_alert(stream: dict) -> None:
         pass
 
 
+def alert_if_new(stream: dict, seen: set) -> int:
+    if stream["id"] in seen or not title_ok(stream["title"]):
+        return 0
+    print(f"[ALERT] {stream['title']} — {stream['url']}")
+    try:
+        send_ntfy_alert(stream)
+    except Exception as e:
+        print(f"[fout] ntfy-melding versturen mislukt: {e}")
+        return 0
+    seen.add(stream["id"])
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main() -> int:
-    if not YOUTUBE_API_KEY or not NTFY_TOPIC:
-        print("FOUT: zet YOUTUBE_API_KEY en NTFY_TOPIC als environment "
-              "variables (GitHub repo Secrets).")
+    if not NTFY_TOPIC:
+        print("FOUT: zet NTFY_TOPIC als environment variable (repo Secret).")
         return 1
 
     seen = load_seen()
     alerts = 0
 
-    for term in SEARCH_TERMS:
+    # Methode 1: watchlist (gratis, elke run)
+    for handle in WATCHLIST:
         try:
-            streams = search_live_streams(term)
+            stream = check_channel_live(handle)
         except Exception as e:
-            print(f"[fout] zoeken naar '{term}' mislukt: {e}")
+            print(f"[fout] check van {handle} mislukt: {e}")
             continue
+        if stream:
+            print(f"[live] {handle}: {stream['title']}")
+            alerts += alert_if_new(stream, seen)
+        else:
+            print(f"[idle] {handle} is niet live (of titel onbekend)")
 
-        for stream in streams:
-            if stream["id"] in seen or not title_matches(stream["title"]):
-                continue
-            print(f"[ALERT] {stream['title']} — {stream['url']}")
+    # Methode 2: API-zoektocht, alleen in het eerste venster van elk uur
+    minute = datetime.now(timezone.utc).minute
+    if YOUTUBE_API_KEY and minute < API_SEARCH_WINDOW_MINUTES:
+        print("[info] uurlijkse brede API-zoektocht...")
+        for term in SEARCH_TERMS:
             try:
-                send_ntfy_alert(stream)
-                alerts += 1
+                for stream in search_live_streams(term):
+                    alerts += alert_if_new(stream, seen)
             except Exception as e:
-                print(f"[fout] ntfy-melding versturen mislukt: {e}")
-            seen.add(stream["id"])
+                print(f"[fout] zoeken naar '{term}' mislukt: {e}")
 
     save_seen(seen)
-    print(f"Klaar: {alerts} nieuwe alert(s) verstuurd, "
-          f"{len(seen)} streams in geschiedenis.")
+    print(f"Klaar: {alerts} nieuwe alert(s), {len(seen)} streams in geschiedenis.")
     return 0
 
 
