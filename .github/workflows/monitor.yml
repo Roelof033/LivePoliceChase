@@ -2,7 +2,7 @@ name: Police Chase Monitor
 
 on:
   schedule:
-    # Elke 5 minuten (GitHub kan runs enkele minuten vertragen op drukke momenten)
+    # Elke 5 minuten (GitHub kan runs enkele minuten vertragen op drukke momenten.)
     - cron: "*/5 * * * *"
   workflow_dispatch: {}   # handmatig starten via de Actions-tab (handig om te testen)
 
